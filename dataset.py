@@ -72,18 +72,26 @@ class Traffic(Dataset):
 def load_water(root, batch_size,label=False):
     
     data = pd.read_csv(root)
+    data.columns = [str(col).strip() for col in data.columns]
     data = data.rename(columns={"Normal/Attack":"label"})
-    data.label[data.label!="Normal"]=1
-    data.label[data.label=="Normal"]=0
-    data["Timestamp"] = pd.to_datetime(data["Timestamp"])
+
+    label_series = data["label"]
+    if pd.api.types.is_numeric_dtype(label_series):
+        data["label"] = label_series.astype(np.int32)
+    else:
+        data["label"] = (label_series.astype(str).str.strip() != "Normal").astype(np.int32)
+
+    data["Timestamp"] = pd.to_datetime(data["Timestamp"], errors="coerce")
+    data = data.dropna(subset=["Timestamp"])
     data = data.set_index("Timestamp")
 
     #%%
-    feature = data.iloc[:,:51]
+    feature = data.iloc[:,:51].apply(pd.to_numeric, errors="coerce")
     mean_df = feature.mean(axis=0)
     std_df = feature.std(axis=0)
 
     norm_feature = (feature-mean_df)/std_df
+    norm_feature = norm_feature.ffill().bfill()
     norm_feature = norm_feature.dropna(axis=1)
     n_sensor = len(norm_feature.columns)
 

@@ -213,7 +213,7 @@ else:
     init = torch.zeros([n_sensor, n_sensor], device=device)
     init = xavier_uniform_(init).abs()
     init = init.fill_diagonal_(0.0)
-A = torch.tensor(init, requires_grad=True, device=device)
+A = init.detach().clone().requires_grad_(True)
 
 model = GANF(
     args.n_blocks,
