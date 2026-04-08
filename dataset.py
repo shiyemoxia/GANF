@@ -1,11 +1,13 @@
 #%%
+import sys
+from pathlib import Path
+
 import pandas as pd
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import DataLoader, Dataset
 import numpy as np
 
 # %%
-from torch.utils.data import DataLoader
 def load_traffic(root, batch_size):
     """
     Load traffic dataset
@@ -169,3 +171,151 @@ class WaterLabel(Dataset):
         data = self.data[start:end].reshape([self.window_size,-1, 1])
 
         return torch.FloatTensor(data).transpose(0,1),self.label[index]
+
+
+SUPPORTED_TS_CFLOW_DATASETS = {"swat", "wadi", "psm", "smd", "msl", "smap"}
+
+
+def _ensure_ts_cflow_import():
+    repo_root = Path(__file__).resolve().parents[1]
+    repo_root_str = str(repo_root)
+    if repo_root_str not in sys.path:
+        sys.path.insert(0, repo_root_str)
+
+
+class GANFTimeSeriesAdapter(Dataset):
+    """Adapt TS-CFLOW window datasets to GANF's [K, L, 1] input layout."""
+
+    def __init__(self, base_dataset, label_reduction="any"):
+        super().__init__()
+        self.base_dataset = base_dataset
+        self.label_reduction = label_reduction
+        self.label = pd.Series(self._build_window_labels(), name="label")
+
+    def _reduce_label(self, label_window):
+        if self.label_reduction == "any":
+            return int(np.any(label_window))
+        if self.label_reduction == "first":
+            return int(label_window[0])
+        if self.label_reduction == "last":
+            return int(label_window[-1])
+        raise ValueError(
+            "Unsupported label_reduction '{}'. Expected one of: any/first/last".format(
+                self.label_reduction
+            )
+        )
+
+    def _build_window_labels(self):
+        labels = getattr(self.base_dataset, "labels", None)
+        if labels is None:
+            return np.zeros(len(self.base_dataset), dtype=np.int32)
+
+        labels = np.asarray(labels, dtype=np.int32)
+        window_labels = np.empty(len(self.base_dataset), dtype=np.int32)
+
+        for idx, start_idx in enumerate(self.base_dataset.indices):
+            end_idx = start_idx + self.base_dataset.window_size
+            window_labels[idx] = self._reduce_label(labels[start_idx:end_idx])
+
+        return window_labels
+
+    def __len__(self):
+        return len(self.base_dataset)
+
+    def __getitem__(self, index):
+        sample = self.base_dataset[index]
+        window = sample["data"].float()
+        return window.unsqueeze(-1).transpose(0, 1)
+
+
+class GANFWindowSubset(Dataset):
+    """Subset wrapper that keeps window labels accessible for GANF metrics."""
+
+    def __init__(self, dataset, indices):
+        super().__init__()
+        self.dataset = dataset
+        self.indices = np.asarray(indices, dtype=np.int64)
+        self.label = pd.Series(
+            dataset.label.to_numpy(dtype=np.int32, copy=False)[self.indices],
+            name="label",
+        )
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, index):
+        return self.dataset[int(self.indices[index])]
+
+
+def _split_eval_dataset(dataset, val_ratio):
+    if not 0.0 < val_ratio < 1.0:
+        raise ValueError("val_ratio must be in (0, 1), got {}".format(val_ratio))
+
+    n_windows = len(dataset)
+    if n_windows < 2:
+        raise ValueError("Need at least 2 windows to build validation/test splits")
+
+    split_idx = int(n_windows * val_ratio)
+    split_idx = min(max(split_idx, 1), n_windows - 1)
+    indices = np.arange(n_windows)
+    return (
+        GANFWindowSubset(dataset, indices[:split_idx]),
+        GANFWindowSubset(dataset, indices[split_idx:]),
+    )
+
+
+def load_timeseries(
+    data_dir,
+    batch_size,
+    dataset_type="swat",
+    machine=None,
+    window_size=60,
+    stride_size=10,
+    val_ratio=0.5,
+    label_reduction="any",
+):
+    """Load TS-CFLOW datasets and adapt them to GANF's expected input format."""
+
+    dataset_type = dataset_type.lower()
+    if dataset_type not in SUPPORTED_TS_CFLOW_DATASETS:
+        raise ValueError(
+            "Unsupported dataset_type '{}'. Expected one of: {}".format(
+                dataset_type, ", ".join(sorted(SUPPORTED_TS_CFLOW_DATASETS))
+            )
+        )
+
+    _ensure_ts_cflow_import()
+    from ts_cflow.datasets import load_dataset as load_ts_cflow_dataset
+
+    machine = None if machine in (None, "", "None", "none") else machine
+
+    train_base = load_ts_cflow_dataset(
+        dataset_type=dataset_type,
+        data_path=str(data_dir),
+        split="train",
+        window_size=window_size,
+        stride=stride_size,
+        machine=machine,
+        normalize=True,
+    )
+    test_base = load_ts_cflow_dataset(
+        dataset_type=dataset_type,
+        data_path=str(data_dir),
+        split="test",
+        window_size=window_size,
+        stride=stride_size,
+        machine=machine,
+        normalize=True,
+        norm_stats=train_base.norm_stats,
+    )
+
+    train_dataset = GANFTimeSeriesAdapter(train_base, label_reduction=label_reduction)
+    eval_dataset = GANFTimeSeriesAdapter(test_base, label_reduction=label_reduction)
+    val_dataset, test_dataset = _split_eval_dataset(eval_dataset, val_ratio=val_ratio)
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    n_sensor = train_base.data.shape[1]
+
+    return train_loader, val_loader, test_loader, n_sensor
