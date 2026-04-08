@@ -81,7 +81,11 @@ def load_water(root, batch_size,label=False):
     else:
         data["label"] = (label_series.astype(str).str.strip() != "Normal").astype(np.int32)
 
-    data["Timestamp"] = pd.to_datetime(data["Timestamp"], errors="coerce")
+    data["Timestamp"] = pd.to_datetime(
+        data["Timestamp"],
+        format="%d/%m/%Y %I:%M:%S %p",
+        errors="coerce",
+    )
     data = data.dropna(subset=["Timestamp"])
     data = data.set_index("Timestamp")
 
@@ -129,7 +133,8 @@ class Water(Dataset):
         delat_time =  df.index[end_idx]-df.index[start_idx]
         idx_mask = delat_time==pd.Timedelta(self.window_size,unit='s')
 
-        return df.values, start_idx[idx_mask], label[start_idx[idx_mask]]
+        window_labels = label.iloc[start_idx[idx_mask]].reset_index(drop=True)
+        return df.values, start_idx[idx_mask], window_labels
 
     def __len__(self):
 
@@ -164,7 +169,8 @@ class WaterLabel(Dataset):
         delat_time =  df.index[end_idx]-df.index[start_idx]
         idx_mask = delat_time==pd.Timedelta(self.window_size,unit='s')
 
-        return df.values, start_idx[idx_mask], label[start_idx[idx_mask]]
+        window_labels = label.iloc[start_idx[idx_mask]].reset_index(drop=True)
+        return df.values, start_idx[idx_mask], window_labels
 
     def __len__(self):
 
